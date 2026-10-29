@@ -1,7 +1,7 @@
 from flask import Flask, jsonify, request
 from flask_cors import CORS
 
-app = Flask(name)
+app = Flask(__name__)
 CORS(app)  # السماح بالاتصال الخارجي
 
 # متغير لتخزين الكلمة مؤقتاً
@@ -20,5 +20,5 @@ def home():
     # في حال طلب GET
     return jsonify(latest_data)
 
-if name == "main":
+if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000)

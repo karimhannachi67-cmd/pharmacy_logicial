@@ -2,7 +2,7 @@ from flask import Flask, jsonify, request
 from flask_cors import CORS
 
 app = Flask(name)
-CORS(app)  # لتفعيل السماح بالاتصال من تطبيقات الواجهة
+CORS(app)
 
 # متغير مؤقت لتخزين الكلمة
 latest_data = {"latest_word": "لا توجد كلمات بعد"}
@@ -17,7 +17,6 @@ def handle_word():
             return jsonify({"status": "success", "message": "تم الحفظ بنجاح"})
         return jsonify({"status": "error", "message": "بيانات غير صالحة"}), 400
     
-    # في حال طلب GET (جلب البيانات)
     return jsonify(latest_data)
 
 if name == "main":

@@ -1,19 +1,22 @@
 from flask import Flask, jsonify, request
 
-app = Flask(__name__)
+app = Flask(name)
 
-# صفحة تجريبية للتأكد من أن السيرفر يعمل
-@app.route("/")
+# متغير لتخزين الكلمة أو البيانات مؤقتاً للتجربة
+latest_word = "لا توجد بيانات بعد"
+
+@app.route("/", methods=["GET", "POST"])
 def home():
-    return jsonify({"status": "success", "message": "Mahalat Platform Server is running!"})
+    global latest_word
+    if request.method == "POST":
+        data = request.get_json()
+        if data and "word" in data:
+            latest_word = data["word"]
+            return jsonify({"status": "success", "message": "تم الحفظ بنجاح"})
+        return jsonify({"status": "error", "message": "بيانات غير صالحة"}), 400
+    
+    # في حال طلب GET على الصفحة الرئيسية أو كـ API
+    return jsonify({"status": "success", "latest_words": latest_word})
 
-# يمكنك إضافة مسارات (Routes) الخاصة بمشروعك هنا
-# مثال: مسار لجلب المنتجات أو بيانات الصيدلية/المحل
-@app.route("/api/data", methods=["GET"])
-def get_data():
-    # ضع منطق قاعدة البيانات أو البيانات الخاصة بك هنا
-    return jsonify({"data": []})
-
-if __name__ == "__main__":
-    # تشغيل السيرفر على 0.0.0.0 ليكون متاحاً عبر الشبكة المحلية، والمنفذ (Port) مثلاً 5000 أو 3000
-    app.run(host="0.0.0.0", port=5000, debug=True)
+if name == "main":
+    app.run(host="0.0.0.0", port=5000)

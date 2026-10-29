@@ -2,13 +2,13 @@ from flask import Flask, jsonify, request
 from flask_cors import CORS
 
 app = Flask(name)
-CORS(app)  # تفعيل السماح بالاتصال من تطبيقات الواجهة الأمامية
+CORS(app)  # لتفعيل السماح بالاتصال من تطبيقات الواجهة
 
-# متغير مؤقت لتخزين آخر كلمة مرسلة
+# متغير مؤقت لتخزين الكلمة
 latest_data = {"latest_word": "لا توجد كلمات بعد"}
 
-@app.route("/", methods=["GET", "POST"])
-def home():
+@app.route("/api/word", methods=["GET", "POST"])
+def handle_word():
     global latest_data
     if request.method == "POST":
         data = request.get_json()

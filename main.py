@@ -4,11 +4,11 @@ from flask_cors import CORS
 app = Flask(name)
 CORS(app)
 
-# متغير مؤقت لتخزين الكلمة
+# متغير لتخزين الكلمة
 latest_data = {"latest_word": "لا توجد كلمات بعد"}
 
-@app.route("/api/word", methods=["GET", "POST"])
-def handle_word():
+@app.route("/", methods=["GET", "POST"])
+def home():
     global latest_data
     if request.method == "POST":
         data = request.get_json()
@@ -17,6 +17,7 @@ def handle_word():
             return jsonify({"status": "success", "message": "تم الحفظ بنجاح"})
         return jsonify({"status": "error", "message": "بيانات غير صالحة"}), 400
     
+    # إرجاع البيانات بنفس المفتاح الذي يقرأه التطبيق
     return jsonify(latest_data)
 
 if name == "main":

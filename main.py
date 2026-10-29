@@ -4,7 +4,7 @@ from flask_cors import CORS
 import psycopg2
 from datetime import datetime
 
-app = Flask(name)
+app = Flask(__name__)
 CORS(app)
 
 # رابط قاعدة البيانات الذي حصلت عليه من Render
@@ -71,5 +71,5 @@ def get_data():
         
     return jsonify(records)
 
-if name == "main":
+if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000)

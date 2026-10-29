@@ -29,6 +29,10 @@ def init_db():
 # تشغيل دالة إنشاء الجدول عند بدء السيرفر
 init_db()
 
+@app.route("/", methods=["GET"])
+def index():
+    return jsonify({"status": "running", "message": "السيرفر يعمل بنجاح، استخدم مسار /data للبيانات"})
+
 @app.route("/data", methods=["POST"])
 def add_data():
     data = request.get_json()

@@ -104,7 +104,7 @@ def get_me():
 @app.post("/api/me/photo")
 def set_photo():
     ph = str(body().get("photo", ""))
-    if ph and not ph.startswith("data:image/"):
+    if ph and not re.fullmatch(r"data:image/(jpeg|png|webp|gif);base64,[A-Za-z0-9+/=]+", ph):
         return jsonify(error="bad"), 400
     if len(ph) > 300000:
         return jsonify(error="big"), 413
@@ -164,7 +164,7 @@ def overview():
     d = load(); sess(d, "admin"); now = int(time.time() * 1000)
     out = []
     for p in d["pharmacies"]:
-        row = {k: p.get(k) for k in ("id", "name", "manager", "address", "lat", "lng", "status", "created")}
+        row = {k: p.get(k) for k in ("id", "name", "manager", "address", "lat", "lng", "status", "created", "photo")}
         row["patients"] = sum(1 for x in d["patients"] if x["ph"] == p["name"])
         row["ops"] = sum(1 for h in d["history"] if h["ph"] == p["name"])
         out.append(row)
@@ -200,6 +200,45 @@ def rename():
         for x in d["patients"] + d["history"]:
             if x["ph"] == old:
                 x["ph"] = new
+        save(d)
+    return jsonify(ok=True)
+
+@app.get("/api/admin/patients")
+def admin_patients():
+    d = load(); sess(d, "admin")
+    return jsonify(d["patients"])
+
+@app.post("/api/admin/patient/update")
+def admin_patient_update():
+    b = body()
+    f = lambda k: str(b.get(k, "")).strip()[:120]
+    fn, ln, nin, dob, drug, ordn, ph = f("fn"), f("ln"), f("nin"), f("dob"), f("drug"), f("ord"), f("ph")
+    try:
+        dur, start = int(b.get("dur", 0)), int(b.get("start", 0))
+    except Exception:
+        dur = start = 0
+    if not (fn and ln and dob and drug and ordn and ph and 0 < dur <= 3650 and start > 0 and re.fullmatch(r"\d{18}", nin)):
+        return jsonify(error="fill"), 400
+    with lock:
+        d = load(); sess(d, "admin")
+        x = next((x for x in d["patients"] if x["id"] == b.get("id")), None) or abort(404)
+        if not any(p["name"] == ph for p in d["pharmacies"]):
+            return jsonify(error="fill"), 400
+        if any(y["ord"].lower() == ordn.lower() for y in d["patients"] if y is not x):
+            return jsonify(error="ord"), 409
+        x.update(fn=fn, ln=ln, nin=nin, dob=dob, drug=drug, ord=ordn, dur=dur, start=start, ph=ph)
+        save(d)
+    return jsonify(ok=True)
+
+@app.post("/api/admin/patient/delete")
+def admin_patient_delete():
+    b = body()
+    with lock:
+        d = load(); sess(d, "admin")
+        n = len(d["patients"])
+        d["patients"] = [x for x in d["patients"] if x["id"] != b.get("id")]
+        if len(d["patients"]) == n:
+            abort(404)
         save(d)
     return jsonify(ok=True)
 

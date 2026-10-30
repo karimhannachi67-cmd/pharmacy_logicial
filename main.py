@@ -12,9 +12,12 @@ lock = threading.Lock()
 def load():
     try:
         with open(DB, encoding="utf-8") as f:
-            return json.load(f)
+            d = json.load(f)
     except Exception:
-        return {"pharmacies": [], "patients": [], "history": [], "tokens": {}}
+        d = {"pharmacies": [], "patients": [], "history": [], "tokens": {}}
+    cut = int(time.time() * 1000) - 365 * DAY          # السجل يُحتفظ به سنة فقط
+    d["history"] = [h for h in d["history"] if h["t"] >= cut]
+    return d
 
 def save(d):
     with open(DB, "w", encoding="utf-8") as f:
@@ -116,12 +119,13 @@ def set_photo():
 @app.get("/api/patients")
 def patients():
     d = load(); me(d, sess(d, "ph"))
-    return jsonify(d["patients"])
+    addr = {p["name"]: p["address"] for p in d["pharmacies"]}
+    return jsonify([{**x, "addr": addr.get(x["ph"], "")} for x in d["patients"]])
 
 @app.get("/api/history")
 def history():
     d = load(); p = me(d, sess(d, "ph"))
-    return jsonify([h for h in d["history"] if h["ph"] == p["name"]][-500:])
+    return jsonify([h for h in d["history"] if h["ph"] == p["name"]][-5000:])
 
 @app.post("/api/patients")
 def save_patient():
@@ -154,7 +158,7 @@ def save_patient():
             d["patients"].append({"id": pid, "fn": fn, "ln": ln, "nin": nin, "dob": dob, "drug": drug,
                                   "ord": ordn, "dur": dur, "start": now, "ph": p["name"]})
             k, n = "logNew", fn + " " + ln
-        d["history"].append({"t": now, "k": k, "n": n, "ph": p["name"]})
+        d["history"].append({"id": secrets.token_hex(4), "t": now, "k": k, "n": n, "ph": p["name"]})
         save(d)
     return jsonify(ok=True)
 
@@ -240,6 +244,43 @@ def admin_patient_delete():
         if len(d["patients"]) == n:
             abort(404)
         save(d)
+    return jsonify(ok=True)
+
+@app.get("/api/admin/history")
+def a_history():
+    with lock:
+        d = load(); sess(d, "admin")
+        if any("id" not in h for h in d["history"]):
+            for h in d["history"]:
+                h.setdefault("id", secrets.token_hex(4))
+            save(d)
+    return jsonify(d["history"])
+
+@app.post("/api/admin/history/update")
+def a_history_update():
+    b = body()
+    try:
+        tm = int(b.get("t"))
+    except Exception:
+        tm = 0
+    n = str(b.get("n", "")).strip()[:120]
+    if not (tm > 0 and n and b.get("k") in ("logNew", "logRenew")):
+        return jsonify(error="fill"), 400
+    with lock:
+        d = load(); sess(d, "admin")
+        h = next((x for x in d["history"] if x.get("id") == b.get("id")), None) or abort(404)
+        if not any(p["name"] == b.get("ph") for p in d["pharmacies"]):
+            return jsonify(error="fill"), 400
+        h.update(t=tm, k=b["k"], n=n, ph=b["ph"]); save(d)
+    return jsonify(ok=True)
+
+@app.post("/api/admin/history/delete")
+def a_history_delete():
+    b = body()
+    with lock:
+        d = load(); sess(d, "admin")
+        h = next((x for x in d["history"] if x.get("id") == b.get("id")), None) or abort(404)
+        d["history"].remove(h); save(d)
     return jsonify(ok=True)
 
 if __name__ == "__main__":

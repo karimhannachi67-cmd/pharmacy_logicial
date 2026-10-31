@@ -46,6 +46,21 @@ def me(d, s):
 def taken(d, name, skip=None):
     return any(p["name"].strip().lower() == name.strip().lower() and p["id"] != skip for p in d["pharmacies"])
 
+def parse_drugs(b):
+    raw = b.get("drugs")
+    if not isinstance(raw, list):
+        return []
+    out = []
+    for x in raw[:10]:
+        try:
+            n, q = str(x.get("n", "")).strip()[:80], int(x.get("q"))
+        except Exception:
+            return None
+        if not n or not 0 < q <= 9999:
+            return None
+        out.append({"n": n, "q": q})
+    return out
+
 def age(dob):
     try:
         y, m, dd = map(int, dob.split("-")); t = date.today()
@@ -132,6 +147,11 @@ def save_patient():
     b = body()
     f = lambda k: str(b.get(k, "")).strip()[:120]
     fn, ln, nin, dob, drug, ordn = f("fn"), f("ln"), f("nin"), f("dob"), f("drug"), f("ord")
+    drugs = parse_drugs(b)
+    if drugs is None or ("drugs" in b and not drugs):
+        return jsonify(error="fill"), 400
+    if drugs:
+        drug = ", ".join(f"{x['n']} ×{x['q']}" for x in drugs)
     pid = b.get("id")
     try:
         dur = int(b.get("dur", 0))
@@ -150,13 +170,17 @@ def save_patient():
             if active(old):
                 return jsonify(error="active"), 409
             old.update(drug=drug, ord=ordn, dur=dur, start=now, ph=p["name"])
+            if drugs:
+                old["drugs"] = drugs
+            else:
+                old.pop("drugs", None)
             k, n = "logRenew", old["fn"] + " " + old["ln"]
         else:
             same = [x for x in d["patients"] if x["nin"] == nin]
             if same and not (age(dob) < 7 and any(age(x["dob"]) >= 18 and active(x) for x in same)):
                 return jsonify(error="nin"), 409
             d["patients"].append({"id": pid, "fn": fn, "ln": ln, "nin": nin, "dob": dob, "drug": drug,
-                                  "ord": ordn, "dur": dur, "start": now, "ph": p["name"]})
+                                  "ord": ordn, "dur": dur, "start": now, "ph": p["name"], **({"drugs": drugs} if drugs else {})})
             k, n = "logNew", fn + " " + ln
         d["history"].append({"id": secrets.token_hex(4), "t": now, "k": k, "n": n, "ph": p["name"]})
         save(d)
@@ -216,7 +240,7 @@ def admin_patients():
 def admin_patient_update():
     b = body()
     f = lambda k: str(b.get(k, "")).strip()[:120]
-    fn, ln, nin, dob, drug, ordn, ph = f("fn"), f("ln"), f("nin"), f("dob"), f("drug"), f("ord"), f("ph")
+    fn, ln, nin, dob, drug, ordn, ph = f("fn"), f("ln"), f("nin"), f("dob"), str(b.get("drug", "")).strip()[:300], f("ord"), f("ph")
     try:
         dur, start = int(b.get("dur", 0)), int(b.get("start", 0))
     except Exception:
@@ -230,6 +254,8 @@ def admin_patient_update():
             return jsonify(error="fill"), 400
         if any(y["ord"].lower() == ordn.lower() for y in d["patients"] if y is not x):
             return jsonify(error="ord"), 409
+        if drug != x.get("drug"):
+            x.pop("drugs", None)
         x.update(fn=fn, ln=ln, nin=nin, dob=dob, drug=drug, ord=ordn, dur=dur, start=start, ph=ph)
         save(d)
     return jsonify(ok=True)

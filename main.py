@@ -343,7 +343,9 @@ def save_patient():
     f = lambda k: str(b.get(k, "")).strip()[:120]
     fn, ln, nin, dob, drug, ordn, doc = f("fn"), f("ln"), f("nin"), f("dob"), f("drug"), f("ord"), f("doc")
     drugs = parse_drugs(b)
-    if drugs is None or ("drugs" in b and not drugs):
+    if drugs is None:
+        return jsonify(error="qty"), 400
+    if "drugs" in b and not drugs:
         return jsonify(error="fill"), 400
     if drugs:
         drug = ", ".join(f"{x['n']} ×{x['q']}" for x in drugs)
@@ -352,7 +354,9 @@ def save_patient():
         dur = int(b.get("dur", 0))
     except Exception:
         dur = 0
-    if not (fn and ln and dob and drug and ordn and 0 < dur <= 3650 and isinstance(pid, int) and re.fullmatch(r"\d{18}", nin) and re.fullmatch(ORD_RE, doc)):
+    if dur > 3650:
+        return jsonify(error="dur"), 400
+    if not (fn and ln and dob and drug and ordn and 0 < dur and isinstance(pid, int) and re.fullmatch(r"\d{18}", nin) and re.fullmatch(ORD_RE, doc)):
         return jsonify(error="fill"), 400
     with lock:
         d = load(); p = me(d, sess(d, "ph"))

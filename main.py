@@ -58,7 +58,17 @@ def main_only(s):
     if s.get("emp"):
         abort(403)
 
+BREVO_KEY = os.environ.get("BREVO_KEY", "")   # اختياري: إرسال عبر API (Render المجاني يبلوكي SMTP)
+
 def send_mail(to, subject, text):
+    if BREVO_KEY:
+        import urllib.request
+        req = urllib.request.Request("https://api.brevo.com/v3/smtp/email", method="POST",
+            data=json.dumps({"sender": {"name": "PharmaLink", "email": MAIL_USER}, "to": [{"email": to}],
+                             "subject": subject, "textContent": text}).encode(),
+            headers={"api-key": BREVO_KEY, "Content-Type": "application/json", "accept": "application/json"})
+        urllib.request.urlopen(req, timeout=12).read()
+        return
     m = EmailMessage()
     m["From"], m["To"], m["Subject"] = f"PharmaLink <{MAIL_USER}>", to, subject
     m.set_content(text)
@@ -203,13 +213,11 @@ def find_ph(d, name):
 
 @app.post("/api/forgot")
 def forgot():
-    name = str(body().get("name", "")).strip()
+    b = body(); name, em = str(b.get("name", "")).strip(), str(b.get("email", "")).strip().lower()
     with lock:
         d = load(); p = find_ph(d, name)
-        if not p or p["status"] != "approved":
-            return jsonify(error="nouser"), 404
-        if not p.get("email"):
-            return jsonify(error="noemail"), 400
+        if not p or p["status"] != "approved" or not em or p.get("email", "").lower() != em:
+            return jsonify(error="nouser"), 404   # الاسم والإيميل لازم يتطابقو
         now = now_ms(); r = d["resets"].get(p["id"], {})
         wait = 60000 - (now - r.get("sent", 0))
         if wait > 0:

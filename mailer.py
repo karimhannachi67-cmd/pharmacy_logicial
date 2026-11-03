@@ -24,7 +24,12 @@ def _send_api(to, subject, text):
     try:
         urllib.request.urlopen(req, timeout=12).read()
     except urllib.error.HTTPError as e:   # نبينو السبب في Logs
-        raise RuntimeError(f"Brevo API {e.code}: {e.read().decode(errors='ignore')[:300]}")
+        error_body = e.read().decode(errors='ignore')
+        print(f"BREVO_ERROR_DETAIL: Code={e.code}, Message={error_body}")
+        raise RuntimeError(f"Brevo API {e.code}: {error_body[:300]}")
+    except Exception as ex:
+        print(f"GENERAL_MAIL_ERROR: {ex}")
+        raise ex
 
 
 def _send_smtp(to, subject, text):

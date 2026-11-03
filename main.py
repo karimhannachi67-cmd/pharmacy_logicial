@@ -11,7 +11,7 @@ DAY = 86400000
 lock = threading.Lock()
 
 MAIL_USER = os.environ.get("MAIL_USER", "pharmalink1324@gmail.com")
-MAIL_PASS = os.environ.get("MAIL_PASS", "pharma112233")   # Gmail يطلب App Password - غيّرو من إعدادات Render
+MAIL_PASS = os.environ.get("MAIL_PASS", "eejkjutsxoucvsaw")   # Gmail يطلب App Password - غيّرو من إعدادات Render
 ORD_RE = r"[A-Za-z0-9/\-]{1,30}"
 EMAIL_RE = r"[^@\s]+@[^@\s]+\.[^@\s]{2,}"
 

@@ -1,6 +1,6 @@
-import os, re, time, json, secrets, threading, math, calendar, smtplib, ssl
+import os, re, time, json, secrets, threading, math, calendar
 from datetime import date, datetime
-from email.message import EmailMessage
+from mailer import send_mail   # الإيميلات في ملف mailer.py
 from flask import Flask, request, jsonify, abort
 from werkzeug.security import generate_password_hash, check_password_hash
 
@@ -10,8 +10,6 @@ ADMIN_KEY = os.environ.get("ADMIN_KEY", "adminadmin08")   # غيّرو من إع
 DAY = 86400000
 lock = threading.Lock()
 
-MAIL_USER = os.environ.get("MAIL_USER", "pharmalink1324@gmail.com")
-MAIL_PASS = os.environ.get("MAIL_PASS", "eejkjutsxoucvsaw")   # Gmail يطلب App Password - غيّرو من إعدادات Render
 ORD_RE = r"[A-Za-z0-9/\-]{1,30}"
 EMAIL_RE = r"[^@\s]+@[^@\s]+\.[^@\s]{2,}"
 
@@ -57,24 +55,6 @@ def confirm(p, b):
 def main_only(s):
     if s.get("emp"):
         abort(403)
-
-BREVO_KEY = os.environ.get("BREVO_KEY", "")   # اختياري: إرسال عبر API (Render المجاني يبلوكي SMTP)
-
-def send_mail(to, subject, text):
-    if BREVO_KEY:
-        import urllib.request
-        req = urllib.request.Request("https://api.brevo.com/v3/smtp/email", method="POST",
-            data=json.dumps({"sender": {"name": "PharmaLink", "email": MAIL_USER}, "to": [{"email": to}],
-                             "subject": subject, "textContent": text}).encode(),
-            headers={"api-key": BREVO_KEY, "Content-Type": "application/json", "accept": "application/json"})
-        urllib.request.urlopen(req, timeout=12).read()
-        return
-    m = EmailMessage()
-    m["From"], m["To"], m["Subject"] = f"PharmaLink <{MAIL_USER}>", to, subject
-    m.set_content(text)
-    with smtplib.SMTP_SSL("smtp.gmail.com", 465, context=ssl.create_default_context(), timeout=12) as c:
-        c.login(MAIL_USER, MAIL_PASS)
-        c.send_message(m)
 
 def load():
     try:

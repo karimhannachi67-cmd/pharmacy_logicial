@@ -196,7 +196,11 @@ def forgot():
     b = body(); name, em = str(b.get("name", "")).strip(), str(b.get("email", "")).strip().lower()
     with lock:
         d = load(); p = find_ph(d, name)
-        if not p or p["status"] != "approved" or not em or p.get("email", "").lower() != em:
+        if not p or p["status"] != "approved":
+            return jsonify(error="nouser"), 404
+        if not p.get("email"):
+            return jsonify(error="noemail"), 400  # حساب قديم بلا إيميل: الأدمن يزيدو
+        if not em or p["email"].lower() != em:
             return jsonify(error="nouser"), 404   # الاسم والإيميل لازم يتطابقو
         now = now_ms(); r = d["resets"].get(p["id"], {})
         wait = 60000 - (now - r.get("sent", 0))
@@ -423,6 +427,18 @@ def renew():
             abort(400)
         grant(p, m); save(d)
     return jsonify(ok=True, expires=p["expires"])
+
+@app.post("/api/admin/email")
+def admin_email():
+    b = body(); em = str(b.get("email", "")).strip().lower()
+    if not re.fullmatch(EMAIL_RE, em):
+        abort(400)
+    with lock:
+        d = load(); sess(d, "admin"); p = find(d, b)
+        if any(x.get("email") == em and x["id"] != p["id"] for x in d["pharmacies"]):
+            return jsonify(error="emailx"), 409
+        p["email"] = em; save(d)
+    return jsonify(ok=True)
 
 @app.post("/api/admin/rename")
 def rename():

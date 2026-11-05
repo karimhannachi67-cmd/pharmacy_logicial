@@ -1,6 +1,7 @@
 import os, re, time, json, secrets, threading, math, calendar
 from datetime import date, datetime
 from mailer import send_mail   # الإيميلات في ملف mailer.py
+from dci import key as dci_key  # DCI داخلي (dci.py)
 from flask import Flask, request, jsonify, abort
 from werkzeug.security import generate_password_hash, check_password_hash
 
@@ -41,15 +42,11 @@ def mask(e):
     return e if len(e) <= 4 else e[:2] + "*" * (len(e) - 4) + e[-2:]
 
 def staff_of(p):
-    return [{"id": p["id"], "name": p["manager"], "ord": p.get("ord", ""), "pw": p["pw"]}] + p.get("staff", [])
-
-def ord_taken(d, o, skip=None):
-    o = o.strip().lower()
-    return any(x["ord"].lower() == o and x["id"] != skip for p in d["pharmacies"] for x in staff_of(p) if x["ord"])
+    return [{"id": p["id"], "name": p["manager"], "pw": p["pw"]}] + p.get("staff", [])
 
 def confirm(p, b):
-    o = str(b.get("pord", "")).strip().lower()
-    x = next((x for x in staff_of(p) if x["ord"] and x["ord"].lower() == o), None)
+    n = str(b.get("pname", "")).strip().lower()
+    x = next((x for x in staff_of(p) if x["name"].strip().lower() == n), None)
     return x if x and check_password_hash(x["pw"], str(b.get("ppw", ""))) else None
 
 def main_only(s):
@@ -96,6 +93,14 @@ def me(d, s):
 def taken(d, name, skip=None):
     return any(p["name"].strip().lower() == name.strip().lower() and p["id"] != skip for p in d["pharmacies"])
 
+def drug_str(drugs):
+    return ", ".join(f"{x['n']} ×{x['q']}" + (f"/{x['full']}" if x["full"] > x["q"] else "") for x in drugs)
+
+def keys_of(rec):
+    if rec.get("drugs"):
+        return {dci_key(x["n"]) for x in rec["drugs"]}
+    return {dci_key(s.split("×")[0]) for s in str(rec.get("drug", "")).split(",") if s.strip()}
+
 def parse_drugs(b):
     raw = b.get("drugs")
     if not isinstance(raw, list):
@@ -104,11 +109,14 @@ def parse_drugs(b):
     for x in raw[:10]:
         try:
             n, q = str(x.get("n", "")).strip()[:80], int(x.get("q"))
+            full = int(x.get("full") or q)       # الكمية الكاملة (افتراضيا = الكمية)
         except Exception:
             return None
-        if not n or not 0 < q <= 9999:
+        if not n or not 0 < q <= 9999 or not 0 < full <= 9999:
             return None
-        out.append({"n": n, "q": q})
+        if q > full:
+            return False
+        out.append({"n": n, "q": q, "full": full})
     return out
 
 def age(dob):
@@ -146,7 +154,7 @@ def register():
             return jsonify(error="exists"), 409
         if any(p.get("email") == email for p in d["pharmacies"]):
             return jsonify(error="emailx"), 409
-        if ord_taken(d, ordn):
+        if any(p.get("ord", "").lower() == ordn.lower() for p in d["pharmacies"]):
             return jsonify(error="ordx"), 409
         d["pharmacies"].append({"id": secrets.token_hex(4), "name": name, "manager": manager,
             "email": email, "wilaya": wil, "ord": ordn, "staff": [],
@@ -171,7 +179,7 @@ def login():
                 p = q
             else:
                 for q in d["pharmacies"]:   # دخول العامل: رقم الأوردر + كلمة السر
-                    e = next((e for e in q.get("staff", []) if e["ord"].lower() == name.lower()), None)
+                    e = next((e for e in q.get("staff", []) if e["name"].strip().lower() == name.lower()), None)
                     if e and check_password_hash(e["pw"], pw):
                         p, emp = q, e
                         break
@@ -258,7 +266,7 @@ def get_me():
     who = next((x for x in staff_of(p) if x["id"] == (emp or p["id"])), None) or abort(401)
     return jsonify(name=p["name"], photo=p.get("photo", ""), manager=p["manager"], address=p["address"],
                    wilaya=p.get("wilaya"), email="" if emp else p.get("email", ""), ord=p.get("ord", ""),
-                   expires=p.get("expires"), emp=bool(emp), who=who["name"], myord=who["ord"])
+                   expires=p.get("expires"), emp=bool(emp), who=who["name"])
 
 @app.post("/api/me/photo")
 def set_photo():
@@ -271,35 +279,26 @@ def set_photo():
         d = load(); s = sess(d, "ph"); main_only(s); p = me(d, s); p["photo"] = ph; save(d)
     return jsonify(ok=True)
 
-@app.post("/api/me/ord")
-def set_ord():
-    o = str(body().get("ord", "")).strip()
-    if not re.fullmatch(ORD_RE, o):
-        return jsonify(error="ord"), 400
-    with lock:
-        d = load(); s = sess(d, "ph"); main_only(s); p = me(d, s)
-        if ord_taken(d, o, p["id"]):
-            return jsonify(error="ordx"), 409
-        p["ord"] = o; save(d)
-    return jsonify(ok=True)
-
 @app.get("/api/staff")
 def staff_list():
     d = load(); s = sess(d, "ph"); main_only(s); p = me(d, s)
-    return jsonify([{"id": e["id"], "name": e["name"], "ord": e["ord"]} for e in p.get("staff", [])])
+    return jsonify([{"id": e["id"], "name": e["name"]} for e in p.get("staff", [])])
 
 @app.post("/api/staff")
 def staff_add():
-    b = body(); name, o, pw = str(b.get("name", "")).strip()[:60], str(b.get("ord", "")).strip(), str(b.get("password", ""))
-    if not name or not re.fullmatch(ORD_RE, o):
+    b = body(); name, pw = str(b.get("name", "")).strip()[:60], str(b.get("password", ""))
+    if not name:
         return jsonify(error="fill"), 400
     if len(pw) < 6:
         return jsonify(error="short"), 400
     with lock:
         d = load(); s = sess(d, "ph"); main_only(s); p = me(d, s)
-        if ord_taken(d, o) or o.lower() == ADMIN_KEY.lower() or taken(d, o):
-            return jsonify(error="ordx"), 409
-        p.setdefault("staff", []).append({"id": secrets.token_hex(4), "name": name, "ord": o, "pw": generate_password_hash(pw)})
+        nm = name.lower()   # اسم العامل هو اسم الدخول: لازم يكون فريد
+        if nm == ADMIN_KEY.lower() or taken(d, name) or any(
+                nm in (q["manager"].strip().lower(), *[e["name"].strip().lower() for e in q.get("staff", [])])
+                for q in d["pharmacies"]):
+            return jsonify(error="namex"), 409
+        p.setdefault("staff", []).append({"id": secrets.token_hex(4), "name": name, "pw": generate_password_hash(pw)})
         save(d)
     return jsonify(ok=True)
 
@@ -335,12 +334,16 @@ def save_patient():
     f = lambda k: str(b.get(k, "")).strip()[:120]
     fn, ln, nin, dob, drug, ordn, doc = f("fn"), f("ln"), f("nin"), f("dob"), f("drug"), f("ord"), f("doc")
     drugs = parse_drugs(b)
+    if drugs is False:
+        return jsonify(error="full"), 400
     if drugs is None:
         return jsonify(error="qty"), 400
     if "drugs" in b and not drugs:
         return jsonify(error="fill"), 400
     if drugs:
-        drug = ", ".join(f"{x['n']} ×{x['q']}" for x in drugs)
+        if len({dci_key(x["n"]) for x in drugs}) < len(drugs):
+            return jsonify(error="dup"), 400
+        drug = drug_str(drugs)
     pid = b.get("id")
     try:
         dur = int(b.get("dur", 0))
@@ -360,10 +363,24 @@ def save_patient():
         old = next((x for x in d["patients"] if x["id"] == pid), None)
         if any(x["ord"].lower() == ordn.lower() for x in d["patients"] if x is not old):
             return jsonify(error="ord"), 409
+        newkeys = keys_of({"drugs": drugs} if drugs else {"drug": drug})
+
+        def clash(pn, pdob, skip):   # نفس الـ DCI نشط عند نفس المريض؟
+            for x in d["patients"]:
+                if x is skip or x["nin"] != pn or x["dob"] != pdob or not active(x):
+                    continue
+                hit = newkeys & keys_of(x)
+                if hit:
+                    return next((y["n"] for y in drugs if dci_key(y["n"]) in hit), "") if drugs else ""
+            return None
+
         if old:
             if active(old):
                 return jsonify(error="active"), 409
-            old.update(drug=drug, ord=ordn, dur=dur, start=now, ph=p["name"], doc=doc, by=who["name"], byord=who["ord"], wil=p.get("wilaya"))
+            hit = clash(old["nin"], old["dob"], old)
+            if hit is not None:
+                return jsonify(error="dci", drug=hit), 409
+            old.update(drug=drug, ord=ordn, dur=dur, start=now, ph=p["name"], doc=doc, by=who["name"], wil=p.get("wilaya"), pord=p.get("ord", ""))
             if drugs:
                 old["drugs"] = drugs
             else:
@@ -371,13 +388,49 @@ def save_patient():
             k, n = "logRenew", old["fn"] + " " + old["ln"]
         else:
             same = [x for x in d["patients"] if x["nin"] == nin]
-            if same and not (age(dob) < 7 and any(age(x["dob"]) >= 18 and active(x) for x in same)):
+            child = age(dob) < 7 and any(age(x["dob"]) >= 18 and active(x) for x in same)
+            if same and not (child or any(x["dob"] == dob for x in same)):
                 return jsonify(error="nin"), 409
+            hit = clash(nin, dob, None)
+            if hit is not None:
+                return jsonify(error="dci", drug=hit), 409
             d["patients"].append({"id": pid, "fn": fn, "ln": ln, "nin": nin, "dob": dob, "drug": drug,
-                                  "ord": ordn, "dur": dur, "start": now, "ph": p["name"], "doc": doc, "by": who["name"], "byord": who["ord"],
-                                  "wil": p.get("wilaya"), **({"drugs": drugs} if drugs else {})})
+                                  "ord": ordn, "dur": dur, "start": now, "ph": p["name"], "doc": doc, "by": who["name"],
+                                  "wil": p.get("wilaya"), "pord": p.get("ord", ""), **({"drugs": drugs} if drugs else {})})
             k, n = "logNew", fn + " " + ln
         d["history"].append({"id": secrets.token_hex(4), "t": now, "k": k, "n": n, "ph": p["name"], "by": who["name"]})
+        save(d)
+    return jsonify(ok=True)
+
+@app.post("/api/patients/complete")
+def complete_patient():
+    b = body(); pid = b.get("id")
+    try:
+        adds = [int(a) for a in b.get("adds")]
+    except Exception:
+        return jsonify(error="fill"), 400
+    if not isinstance(pid, int) or any(a < 0 for a in adds) or not any(adds):
+        return jsonify(error="fill"), 400
+    with lock:
+        d = load(); p = me(d, sess(d, "ph"))
+        who = confirm(p, b)
+        if not who:
+            return jsonify(error="conf"), 403
+        now = int(time.time() * 1000)
+        x = next((x for x in d["patients"] if x["id"] == pid), None)
+        if not x or not x.get("drugs") or len(adds) != len(x["drugs"]):
+            abort(404)
+        if x["start"] + x["dur"] * DAY <= now:
+            return jsonify(error="expired"), 409
+        for dr in x["drugs"]:
+            dr.setdefault("full", dr["q"])
+        if any(a > dr["full"] - dr["q"] for a, dr in zip(adds, x["drugs"])):
+            return jsonify(error="over"), 400
+        for a, dr in zip(adds, x["drugs"]):
+            dr["q"] += a
+        x["drug"] = drug_str(x["drugs"])
+        d["history"].append({"id": secrets.token_hex(4), "t": now, "k": "logDone", "n": x["fn"] + " " + x["ln"],
+                             "ph": p["name"], "by": who["name"]})
         save(d)
     return jsonify(ok=True)
 

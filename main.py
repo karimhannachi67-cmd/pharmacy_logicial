@@ -1,7 +1,21 @@
 import os, re, time, json, secrets, threading, math, calendar
 from datetime import date, datetime
-from mailer import send_mail   # الإيميلات في ملف mailer.py
-from dci import key as dci_key  # DCI داخلي (dci.py)
+try:
+    from mailer import send_mail   # الإيميلات في ملف mailer.py
+    MAIL_OK = True
+except Exception as _e:            # ملف ناقص ما يوقفش السيرفر
+    MAIL_OK = False
+    print("mailer.py ما تحملش:", _e)
+    def send_mail(*a, **k):
+        raise RuntimeError("mailer.py غير موجود")
+try:
+    from dci import key as dci_key  # DCI داخلي (dci.py)
+    DCI_OK = True
+except Exception as _e:
+    DCI_OK = False
+    print("dci.py ما تحملش:", _e)
+    def dci_key(name):
+        return "n:" + " ".join(str(name).lower().split())
 from flask import Flask, request, jsonify, abort
 from werkzeug.security import generate_password_hash, check_password_hash
 
@@ -163,6 +177,10 @@ def register():
             "created": int(time.time() * 1000)})
         save(d)
     return jsonify(ok=True)
+
+@app.get("/api/ping")
+def ping():
+    return jsonify(ok=True, mailer=MAIL_OK, dci=DCI_OK)
 
 @app.post("/api/login")
 def login():

@@ -26,7 +26,7 @@ from werkzeug.security import generate_password_hash, check_password_hash
 app = Flask(__name__)
 
 # إعدادات Supabase (تعتمد على متغيرات البيئة لضمان الأمان وعدم كشف المفاتيح)
-SUPABASE_URL = "https://garjgumzcdijtqbytggz.supabase.co/rest/v1/"
+SUPABASE_URL = "https://garjgumzcdijtqbytggz.supabase.co"
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "")
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 

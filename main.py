@@ -21,10 +21,10 @@ SUPABASE_URL = "https://garjgumzcdijtqbytggz.supabase.co"
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "")
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-# إعدادات Brevo API
+# إعدادات Brevo API (تستخدم BREVO_KEY كما طلبت)
 BREVO_API_KEY = os.environ.get("BREVO_KEY", "")
 
-ADMIN_KEY = os.environ.get("ADMIN_KEY", "")
+ADMIN_KEY = os.environ.get("ADMIN_KEY", "adminadmin08")
 DAY = 86400000
 lock = threading.Lock()
 
@@ -37,9 +37,9 @@ ORD_RE = r"[A-Za-z0-9/\-]{1,30}"
 EMAIL_RE = r"[^@\s]+@[^@\s]+\.[^@\s]{2,}"
 
 def send_brevo_mail(to_email, subject, html_content):
-    """دالة إرسال البريد الإلكتروني عبر Brevo API"""
+    """دالة إرسال البريد الإلكتروني عبر Brevo API باستخدام الإيميل المفعل"""
     if not BREVO_API_KEY:
-        print("BREVO_API_KEY غير معرف!")
+        print("BREVO_KEY غير معرف!")
         return False
     url = "https://api.brevo.com/v3/smtp/email"
     headers = {
@@ -48,13 +48,15 @@ def send_brevo_mail(to_email, subject, html_content):
         "content-type": "application/json"
     }
     payload = {
-        "sender": {"name": "PharmaLink", "email": "pharmalink132@gmail.com.com"},
+        "sender": {"name": "PharmaLink", "email": "Pharmalink132@gmail.com"},
         "to": [{"email": to_email}],
         "subject": subject,
         "htmlContent": html_content
     }
     try:
         res = requests.post(url, json=payload, headers=headers, timeout=10)
+        print("Brevo Response Status:", res.status_code)
+        print("Brevo Response Body:", res.text)
         return res.status_code in [200, 201]
     except Exception as e:
         print("خطأ أثناء الإرسال عبر Brevo:", e)
@@ -712,7 +714,7 @@ def a_history_update():
     with lock:
         pharmacies = get_pharmacies(); sess("admin")
         history_data = get_history()
-        h = next((x for x in history_data if x.get("id") == b.get("id")), None) or abort(404)
+        h = next((x for x in history_data if x.get("id"] == b.get("id")), None) or abort(404)
         if not any(p["name"] == b.get("ph") for p in pharmacies):
             return jsonify(error="fill"), 400
         supabase.table("history").update({"t": tm, "k": b["k"], "n": n, "ph": b["ph"]}).eq("id", h["id"]).execute()

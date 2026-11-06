@@ -714,7 +714,7 @@ def a_history_update():
     with lock:
         pharmacies = get_pharmacies(); sess("admin")
         history_data = get_history()
-        h = next((x for x in history_data if x.get("id"] == b.get("id")), None) or abort(404)
+        h = next((x for x in history_data if x.get("id") == b.get("id")), None) or abort(404)
         if not any(p["name"] == b.get("ph") for p in pharmacies):
             return jsonify(error="fill"), 400
         supabase.table("history").update({"t": tm, "k": b["k"], "n": n, "ph": b["ph"]}).eq("id", h["id"]).execute()

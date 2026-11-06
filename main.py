@@ -1,15 +1,6 @@
-import os, re, time, json, secrets, threading, math, calendar
+import os, re, time, json, secrets, threading, math, calendar, requests
 from datetime import date, datetime
 from supabase import create_client, Client
-
-try:
-    from mailer import send_mail   # الإيميلات في ملف mailer.py
-    MAIL_OK = True
-except Exception as _e:
-    MAIL_OK = False
-    print("mailer.py ما تحملش:", _e)
-    def send_mail(*a, **k):
-        raise RuntimeError("mailer.py غير موجود")
 
 try:
     from dci import key as dci_key  # DCI داخلي (dci.py)
@@ -25,21 +16,49 @@ from werkzeug.security import generate_password_hash, check_password_hash
 
 app = Flask(__name__)
 
-# إعدادات Supabase (تعتمد على متغيرات البيئة لضمان الأمان وعدم كشف المفاتيح)
+# إعدادات Supabase
 SUPABASE_URL = "https://garjgumzcdijtqbytggz.supabase.co"
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "")
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-ADMIN_KEY = os.environ.get("ADMIN_KEY", "adminadmin08")
+# إعدادات Brevo API
+BREVO_API_KEY = os.environ.get("BREVO_KEY", "")
+
+ADMIN_KEY = os.environ.get("ADMIN_KEY", "")
 DAY = 86400000
 lock = threading.Lock()
 
-# الجلسات وإعادة التعيين في الذاكرة لتسريع العمليات
+# الجلسات، إعادة التعيين، والتسجيلات المعلقة في الذاكرة
 TOKENS = {}
 RESETS = {}
+PENDING_REGISTRATIONS = {}  # لتخزين بيانات التسجيل مؤقتاً لحين تأكيد الرمز
 
 ORD_RE = r"[A-Za-z0-9/\-]{1,30}"
 EMAIL_RE = r"[^@\s]+@[^@\s]+\.[^@\s]{2,}"
+
+def send_brevo_mail(to_email, subject, html_content):
+    """دالة إرسال البريد الإلكتروني عبر Brevo API"""
+    if not BREVO_API_KEY:
+        print("BREVO_API_KEY غير معرف!")
+        return False
+    url = "https://api.brevo.com/v3/smtp/email"
+    headers = {
+        "accept": "application/json",
+        "api-key": BREVO_API_KEY,
+        "content-type": "application/json"
+    }
+    payload = {
+        "sender": {"name": "PharmaLink", "email": "no-reply@pharmalink.com"},
+        "to": [{"email": to_email}],
+        "subject": subject,
+        "htmlContent": html_content
+    }
+    try:
+        res = requests.post(url, json=payload, headers=headers, timeout=10)
+        return res.status_code in [200, 201]
+    except Exception as e:
+        print("خطأ أثناء الإرسال عبر Brevo:", e)
+        return False
 
 def now_ms():
     return int(time.time() * 1000)
@@ -158,7 +177,7 @@ def age(dob):
 def home():
     return "PharmaLink API OK (Supabase)"
 
-# ---------- الحسابات ----------
+# ---------- الحسابات والتسجيل مع Brevo ----------
 @app.post("/api/register")
 def register():
     b = body()
@@ -166,6 +185,7 @@ def register():
     name, manager, address, pw = g("name"), g("manager"), g("address"), str(b.get("password", ""))
     email, ordn, wil = g("email").lower(), g("ord"), b.get("wilaya")
     num = lambda v: v if isinstance(v, (int, float)) else None
+    
     if not (name and manager and address and email and ordn):
         return jsonify(error="fill"), 400
     if len(pw) < 6:
@@ -176,6 +196,7 @@ def register():
         return jsonify(error="ord"), 400
     if not (isinstance(wil, int) and 1 <= wil <= 69):
         return jsonify(error="wil"), 400
+
     with lock:
         pharmacies = get_pharmacies()
         if name.lower() == ADMIN_KEY.lower() or taken(pharmacies, name):
@@ -184,20 +205,72 @@ def register():
             return jsonify(error="emailx"), 409
         if any(p.get("ord", "").lower() == ordn.lower() for p in pharmacies):
             return jsonify(error="ordx"), 409
-        
+
+        now = now_ms()
+        pending_data = PENDING_REGISTRATIONS.get(email, {})
+        if 60000 - (now - pending_data.get("sent", 0)) > 0:
+            return jsonify(error="wait", wait=math.ceil((60000 - (now - pending_data.get("sent", 0))) / 1000)), 429
+
+        code = f"{secrets.randbelow(10 ** 6):06d}"
         new_ph = {
             "id": secrets.token_hex(4), "name": name, "manager": manager,
             "email": email, "wilaya": wil, "ord": ordn, "staff": [],
             "address": address, "lat": num(b.get("lat")), "lng": num(b.get("lng")),
             "pw": generate_password_hash(pw), "status": "pending", "photo": "",
-            "created": now_ms()
+            "created": now
         }
-        supabase.table("pharmacies").insert(new_ph).execute()
+        
+        PENDING_REGISTRATIONS[email] = {
+            "data": new_ph,
+            "code_hash": generate_password_hash(code),
+            "exp": now + 600000,
+            "sent": now,
+            "tries": 0
+        }
+
+    html_content = f"""
+    <div style="direction: rtl; font-family: Tahoma, sans-serif; padding: 20px; border: 1px solid #d6e1e3; border-radius: 12px;">
+        <h2 style="color: #0f766e;">مرحباً بك في PharmaLink</h2>
+        <p>كود تأكيد البريد الإلكتروني الخاص بحسابك هو:</p>
+        <h1 style="color: #0d5f58; letter-spacing: 5px; font-size: 32px; text-align: center;">{code}</h1>
+        <p style="color: #5d7279; font-size: 13px;">هذا الرمز صالح لمدة 10 دقائق.</p>
+    </div>
+    """
+    
+    if not send_brevo_mail(email, "PharmaLink - كود تأكيد البريد الإلكتروني", html_content):
+        with lock:
+            PENDING_REGISTRATIONS.pop(email, None)
+        return jsonify(error="mail"), 502
+
+    return jsonify(ok=True, email=mask(email))
+
+@app.post("/api/register/verify")
+def register_verify():
+    b = body()
+    email = str(b.get("email", "")).strip().lower()
+    code = str(b.get("code", "")).strip()
+
+    with lock:
+        reg = PENDING_REGISTRATIONS.get(email)
+        if not reg or reg["exp"] < now_ms():
+            return jsonify(error="codeExp"), 400
+        if reg["tries"] >= 5:
+            PENDING_REGISTRATIONS.pop(email, None)
+            return jsonify(error="locked"), 429
+        if not re.fullmatch(r"\d{6}", code) or not check_password_hash(reg["code_hash"], code):
+            reg["tries"] += 1
+            return jsonify(error="codeBad"), 400
+
+        # حفظ الحساب رسمياً في Supabase عند نجاح الكود
+        pharmacy_data = reg["data"]
+        supabase.table("pharmacies").insert(pharmacy_data).execute()
+        PENDING_REGISTRATIONS.pop(email, None)
+
     return jsonify(ok=True)
 
 @app.get("/api/ping")
 def ping():
-    return jsonify(ok=True, mailer=MAIL_OK, dci=DCI_OK)
+    return jsonify(ok=True, brevo=bool(BREVO_API_KEY), dci=DCI_OK)
 
 @app.post("/api/login")
 def login():
@@ -229,7 +302,7 @@ def login():
         TOKENS[tk] = s
     return jsonify(token=tk, role="admin" if s["role"] == "admin" else "pharmacy")
 
-# ---------- نسيت كلمة السر ----------
+# ---------- نسيت كلمة السر عبر Brevo ----------
 def find_ph(pharmacies, name):
     return next((x for x in pharmacies if x["name"].strip().lower() == name.strip().lower()), None)
 
@@ -251,14 +324,13 @@ def forgot():
         code = f"{secrets.randbelow(10 ** 6):06d}"
         RESETS[p["id"]] = {"h": generate_password_hash(code), "exp": now + 600000, "sent": now, "tries": 0}
         to, pid = p["email"], p["id"]
-    try:
-        send_mail(to, "PharmaLink - كود التأكيد / Code de vérification",
-                  f"كود التأكيد تاعك: {code}\nصالح لمدة 10 دقائق.\n\nVotre code : {code} (valable 10 minutes).")
-    except Exception as e:
-        print("mail error:", e)
+    
+    html_content = f"كود التأكيد تاعك: <b>{code}</b><br>صالح لمدة 10 دقائق.<br><br>Votre code : <b>{code}</b> (valable 10 minutes)."
+    if not send_brevo_mail(to, "PharmaLink - كود التأكيد / Code de vérification", html_content):
         with lock:
             RESETS.pop(pid, None)
         return jsonify(error="mail"), 502
+
     return jsonify(ok=True, email=mask(to))
 
 @app.post("/api/forgot/verify")

@@ -21,23 +21,22 @@ SUPABASE_URL = "https://garjgumzcdijtqbytggz.supabase.co"
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "")
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-# إعدادات Brevo API (تستخدم BREVO_KEY كما طلبت)
+# إعدادات Brevo API
 BREVO_API_KEY = os.environ.get("BREVO_KEY", "")
 
 ADMIN_KEY = os.environ.get("ADMIN_KEY", "adminadmin08")
 DAY = 86400000
 lock = threading.Lock()
 
-# الجلسات، إعادة التعيين، والتسجيلات المعلقة في الذاكرة
+# الجلسات وإعادة التعيين في الذاكرة (أو يمكن تطويرها لاحقاً)
 TOKENS = {}
 RESETS = {}
-PENDING_REGISTRATIONS = {}  # لتخزين بيانات التسجيل مؤقتاً لحين تأكيد الرمز
 
 ORD_RE = r"[A-Za-z0-9/\-]{1,30}"
 EMAIL_RE = r"[^@\s]+@[^@\s]+\.[^@\s]{2,}"
 
 def send_brevo_mail(to_email, subject, html_content):
-    """دالة إرسال البريد الإلكتروني عبر Brevo API باستخدام الإيميل المفعل"""
+    """دالة إرسال البريد الإلكتروني عبر Brevo API"""
     if not BREVO_API_KEY:
         print("BREVO_KEY غير معرف!")
         return False
@@ -177,9 +176,9 @@ def age(dob):
 
 @app.get("/")
 def home():
-    return "PharmaLink API OK (Supabase)"
+    return "PharmaLink API OK (Supabase Auth Codes)"
 
-# ---------- الحسابات والتسجيل مع Brevo ----------
+# ---------- التسجيل ورموز التحقق عبر Supabase ----------
 @app.post("/api/register")
 def register():
     b = body()
@@ -199,36 +198,40 @@ def register():
     if not (isinstance(wil, int) and 1 <= wil <= 69):
         return jsonify(error="wil"), 400
 
-    with lock:
-        pharmacies = get_pharmacies()
-        if name.lower() == ADMIN_KEY.lower() or taken(pharmacies, name):
-            return jsonify(error="exists"), 409
-        if any(p.get("email") == email for p in pharmacies):
-            return jsonify(error="emailx"), 409
-        if any(p.get("ord", "").lower() == ordn.lower() for p in pharmacies):
-            return jsonify(error="ordx"), 409
+    pharmacies = get_pharmacies()
+    if name.lower() == ADMIN_KEY.lower() or taken(pharmacies, name):
+        return jsonify(error="exists"), 409
+    if any(p.get("email") == email for p in pharmacies):
+        return jsonify(error="emailx"), 409
+    if any(p.get("ord", "").lower() == ordn.lower() for p in pharmacies):
+        return jsonify(error="ordx"), 409
 
-        now = now_ms()
-        pending_data = PENDING_REGISTRATIONS.get(email, {})
-        if 60000 - (now - pending_data.get("sent", 0)) > 0:
-            return jsonify(error="wait", wait=math.ceil((60000 - (now - pending_data.get("sent", 0))) / 1000)), 429
+    now = now_ms()
+    existing_code_res = supabase.table("auth_codes").select("*").eq("email", email).execute()
+    existing_code = existing_code_res.data[0] if existing_code_res.data else None
+    
+    if existing_code and (60000 - (now - existing_code.get("sent", 0)) > 0):
+        return jsonify(error="wait", wait=math.ceil((60000 - (now - existing_code.get("sent", 0))) / 1000)), 429
 
-        code = f"{secrets.randbelow(10 ** 6):06d}"
-        new_ph = {
-            "id": secrets.token_hex(4), "name": name, "manager": manager,
-            "email": email, "wilaya": wil, "ord": ordn, "staff": [],
-            "address": address, "lat": num(b.get("lat")), "lng": num(b.get("lng")),
-            "pw": generate_password_hash(pw), "status": "pending", "photo": "",
-            "created": now
-        }
-        
-        PENDING_REGISTRATIONS[email] = {
-            "data": new_ph,
-            "code_hash": generate_password_hash(code),
-            "exp": now + 600000,
-            "sent": now,
-            "tries": 0
-        }
+    code = f"{secrets.randbelow(10 ** 6):06d}"
+    new_ph = {
+        "id": secrets.token_hex(4), "name": name, "manager": manager,
+        "email": email, "wilaya": wil, "ord": ordn, "staff": [],
+        "address": address, "lat": num(b.get("lat")), "lng": num(b.get("lng")),
+        "pw": generate_password_hash(pw), "status": "pending", "photo": "",
+        "created": now
+    }
+    
+    code_data = {
+        "email": email,
+        "code_hash": generate_password_hash(code),
+        "exp": now + 600000,
+        "sent": now,
+        "tries": 0,
+        "data": new_ph
+    }
+
+    supabase.table("auth_codes").upsert(code_data).execute()
 
     html_content = f"""
     <div style="direction: rtl; font-family: Tahoma, sans-serif; padding: 20px; border: 1px solid #d6e1e3; border-radius: 12px;">
@@ -240,8 +243,7 @@ def register():
     """
     
     if not send_brevo_mail(email, "PharmaLink - كود تأكيد البريد الإلكتروني", html_content):
-        with lock:
-            PENDING_REGISTRATIONS.pop(email, None)
+        supabase.table("auth_codes").delete().eq("email", email).execute()
         return jsonify(error="mail"), 502
 
     return jsonify(ok=True, email=mask(email))
@@ -252,21 +254,22 @@ def register_verify():
     email = str(b.get("email", "")).strip().lower()
     code = str(b.get("code", "")).strip()
 
-    with lock:
-        reg = PENDING_REGISTRATIONS.get(email)
-        if not reg or reg["exp"] < now_ms():
-            return jsonify(error="codeExp"), 400
-        if reg["tries"] >= 5:
-            PENDING_REGISTRATIONS.pop(email, None)
-            return jsonify(error="locked"), 429
-        if not re.fullmatch(r"\d{6}", code) or not check_password_hash(reg["code_hash"], code):
-            reg["tries"] += 1
-            return jsonify(error="codeBad"), 400
+    res = supabase.table("auth_codes").select("*").eq("email", email).execute()
+    reg = res.data[0] if res.data else None
 
-        # حفظ الحساب رسمياً في Supabase عند نجاح الكود
-        pharmacy_data = reg["data"]
-        supabase.table("pharmacies").insert(pharmacy_data).execute()
-        PENDING_REGISTRATIONS.pop(email, None)
+    if not reg or reg["exp"] < now_ms():
+        return jsonify(error="codeExp"), 400
+    if reg["tries"] >= 5:
+        supabase.table("auth_codes").delete().eq("email", email).execute()
+        return jsonify(error="locked"), 429
+    if not re.fullmatch(r"\d{6}", code) or not check_password_hash(reg["code_hash"], code):
+        new_tries = reg["tries"] + 1
+        supabase.table("auth_codes").update({"tries": new_tries}).eq("email", email).execute()
+        return jsonify(error="codeBad"), 400
+
+    pharmacy_data = reg["data"]
+    supabase.table("pharmacies").insert(pharmacy_data).execute()
+    supabase.table("auth_codes").delete().eq("email", email).execute()
 
     return jsonify(ok=True)
 
@@ -304,7 +307,7 @@ def login():
         TOKENS[tk] = s
     return jsonify(token=tk, role="admin" if s["role"] == "admin" else "pharmacy")
 
-# ---------- نسيت كلمة السر عبر Brevo ----------
+# ---------- نسيت كلمة السر ----------
 def find_ph(pharmacies, name):
     return next((x for x in pharmacies if x["name"].strip().lower() == name.strip().lower()), None)
 

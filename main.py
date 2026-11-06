@@ -1,13 +1,16 @@
 import os, re, time, json, secrets, threading, math, calendar
 from datetime import date, datetime
+from supabase import create_client, Client
+
 try:
     from mailer import send_mail   # الإيميلات في ملف mailer.py
     MAIL_OK = True
-except Exception as _e:            # ملف ناقص ما يوقفش السيرفر
+except Exception as _e:
     MAIL_OK = False
     print("mailer.py ما تحملش:", _e)
     def send_mail(*a, **k):
         raise RuntimeError("mailer.py غير موجود")
+
 try:
     from dci import key as dci_key  # DCI داخلي (dci.py)
     DCI_OK = True
@@ -16,14 +19,24 @@ except Exception as _e:
     print("dci.py ما تحملش:", _e)
     def dci_key(name):
         return "n:" + " ".join(str(name).lower().split())
+
 from flask import Flask, request, jsonify, abort
 from werkzeug.security import generate_password_hash, check_password_hash
 
 app = Flask(__name__)
-DB = os.environ.get("DB_FILE", "data.json")
-ADMIN_KEY = os.environ.get("ADMIN_KEY", "adminadmin08")   # غيّرو من إعدادات Render
+
+# إعدادات Supabase (تعتمد على متغيرات البيئة لضمان الأمان وعدم كشف المفاتيح)
+SUPABASE_URL = os.environ.get("SUPABASE_URL", "https://garjgumzcdijtqbytgqz.supabase.co")
+SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "")
+supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+
+ADMIN_KEY = os.environ.get("ADMIN_KEY", "adminadmin08")
 DAY = 86400000
 lock = threading.Lock()
+
+# الجلسات وإعادة التعيين في الذاكرة لتسريع العمليات
+TOKENS = {}
+RESETS = {}
 
 ORD_RE = r"[A-Za-z0-9/\-]{1,30}"
 EMAIL_RE = r"[^@\s]+@[^@\s]+\.[^@\s]{2,}"
@@ -56,7 +69,7 @@ def mask(e):
     return e if len(e) <= 4 else e[:2] + "*" * (len(e) - 4) + e[-2:]
 
 def staff_of(p):
-    return [{"id": p["id"], "name": p["manager"], "pw": p["pw"]}] + p.get("staff", [])
+    return [{"id": p["id"], "name": p["manager"], "pw": p["pw"]}] + (p.get("staff") or [])
 
 def confirm(p, b):
     n = str(b.get("pname", "")).strip().lower()
@@ -67,20 +80,20 @@ def main_only(s):
     if s.get("emp"):
         abort(403)
 
-def load():
-    try:
-        with open(DB, encoding="utf-8") as f:
-            d = json.load(f)
-    except Exception:
-        d = {"pharmacies": [], "patients": [], "history": [], "tokens": {}}
-    d.setdefault("resets", {})
-    cut = int(time.time() * 1000) - 365 * DAY          # السجل يُحتفظ به سنة فقط
-    d["history"] = [h for h in d["history"] if h["t"] >= cut]
-    return d
+# دوال جلب البيانات من Supabase
+def get_pharmacies():
+    res = supabase.table("pharmacies").select("*").execute()
+    return res.data or []
 
-def save(d):
-    with open(DB, "w", encoding="utf-8") as f:
-        json.dump(d, f, ensure_ascii=False)
+def get_patients():
+    res = supabase.table("patients").select("*").execute()
+    return res.data or []
+
+def get_history():
+    res = supabase.table("history").select("*").execute()
+    data = res.data or []
+    cut = now_ms() - 365 * DAY
+    return [h for h in data if h.get("t", 0) >= cut]
 
 @app.after_request
 def cors(r):
@@ -92,20 +105,21 @@ def cors(r):
 def body():
     return request.get_json(force=True, silent=True) or {}
 
-def sess(d, role):
-    s = d["tokens"].get(request.headers.get("Authorization", "")[7:])
+def sess(role):
+    s = TOKENS.get(request.headers.get("Authorization", "")[7:])
     if not s or s["role"] != role:
         abort(401)
     return s
 
-def me(d, s):
-    p = next((x for x in d["pharmacies"] if x["id"] == s["id"] and x["status"] == "approved"), None)
+def me(s):
+    pharmacies = get_pharmacies()
+    p = next((x for x in pharmacies if x["id"] == s["id"] and x["status"] == "approved"), None)
     if not p or expired(p):
         abort(401)
     return p
 
-def taken(d, name, skip=None):
-    return any(p["name"].strip().lower() == name.strip().lower() and p["id"] != skip for p in d["pharmacies"])
+def taken(pharmacies, name, skip=None):
+    return any(p["name"].strip().lower() == name.strip().lower() and p["id"] != skip for p in pharmacies)
 
 def drug_str(drugs):
     return ", ".join(f"{x['n']} ×{x['q']}" + (f"/{x['full']}" if x["full"] > x["q"] else "") for x in drugs)
@@ -123,7 +137,7 @@ def parse_drugs(b):
     for x in raw[:10]:
         try:
             n, q = str(x.get("n", "")).strip()[:80], int(x.get("q"))
-            full = int(x.get("full") or q)       # الكمية الكاملة (افتراضيا = الكمية)
+            full = int(x.get("full") or q)
         except Exception:
             return None
         if not n or not 0 < q <= 9999 or not 0 < full <= 9999:
@@ -142,7 +156,7 @@ def age(dob):
 
 @app.get("/")
 def home():
-    return "PharmaLink API OK"
+    return "PharmaLink API OK (Supabase)"
 
 # ---------- الحسابات ----------
 @app.post("/api/register")
@@ -163,19 +177,22 @@ def register():
     if not (isinstance(wil, int) and 1 <= wil <= 69):
         return jsonify(error="wil"), 400
     with lock:
-        d = load()
-        if name.lower() == ADMIN_KEY.lower() or taken(d, name):
+        pharmacies = get_pharmacies()
+        if name.lower() == ADMIN_KEY.lower() or taken(pharmacies, name):
             return jsonify(error="exists"), 409
-        if any(p.get("email") == email for p in d["pharmacies"]):
+        if any(p.get("email") == email for p in pharmacies):
             return jsonify(error="emailx"), 409
-        if any(p.get("ord", "").lower() == ordn.lower() for p in d["pharmacies"]):
+        if any(p.get("ord", "").lower() == ordn.lower() for p in pharmacies):
             return jsonify(error="ordx"), 409
-        d["pharmacies"].append({"id": secrets.token_hex(4), "name": name, "manager": manager,
+        
+        new_ph = {
+            "id": secrets.token_hex(4), "name": name, "manager": manager,
             "email": email, "wilaya": wil, "ord": ordn, "staff": [],
             "address": address, "lat": num(b.get("lat")), "lng": num(b.get("lng")),
             "pw": generate_password_hash(pw), "status": "pending", "photo": "",
-            "created": int(time.time() * 1000)})
-        save(d)
+            "created": now_ms()
+        }
+        supabase.table("pharmacies").insert(new_ph).execute()
     return jsonify(ok=True)
 
 @app.get("/api/ping")
@@ -187,17 +204,17 @@ def login():
     b = body()
     name, pw = str(b.get("name", "")).strip(), str(b.get("password", ""))
     with lock:
-        d = load()
+        pharmacies = get_pharmacies()
         if name == ADMIN_KEY:
             s = {"role": "admin", "id": None}
         else:
             p = emp = None
-            q = next((x for x in d["pharmacies"] if x["name"].strip().lower() == name.lower()), None)
+            q = next((x for x in pharmacies if x["name"].strip().lower() == name.lower()), None)
             if q and check_password_hash(q["pw"], pw):
                 p = q
             else:
-                for q in d["pharmacies"]:   # دخول العامل: رقم الأوردر + كلمة السر
-                    e = next((e for e in q.get("staff", []) if e["name"].strip().lower() == name.lower()), None)
+                for q in pharmacies:
+                    e = next((e for e in (q.get("staff") or []) if e["name"].strip().lower() == name.lower()), None)
                     if e and check_password_hash(e["pw"], pw):
                         p, emp = q, e
                         break
@@ -209,39 +226,38 @@ def login():
                 return jsonify(error="expired"), 403
             s = {"role": "ph", "id": p["id"], "emp": emp["id"] if emp else None}
         tk = secrets.token_hex(24)
-        d["tokens"][tk] = s
-        save(d)
+        TOKENS[tk] = s
     return jsonify(token=tk, role="admin" if s["role"] == "admin" else "pharmacy")
 
 # ---------- نسيت كلمة السر ----------
-def find_ph(d, name):
-    return next((x for x in d["pharmacies"] if x["name"].strip().lower() == name.strip().lower()), None)
+def find_ph(pharmacies, name):
+    return next((x for x in pharmacies if x["name"].strip().lower() == name.strip().lower()), None)
 
 @app.post("/api/forgot")
 def forgot():
     b = body(); name, em = str(b.get("name", "")).strip(), str(b.get("email", "")).strip().lower()
     with lock:
-        d = load(); p = find_ph(d, name)
+        pharmacies = get_pharmacies(); p = find_ph(pharmacies, name)
         if not p or p["status"] != "approved":
             return jsonify(error="nouser"), 404
         if not p.get("email"):
-            return jsonify(error="noemail"), 400  # حساب قديم بلا إيميل: الأدمن يزيدو
+            return jsonify(error="noemail"), 400
         if not em or p["email"].lower() != em:
-            return jsonify(error="nouser"), 404   # الاسم والإيميل لازم يتطابقو
-        now = now_ms(); r = d["resets"].get(p["id"], {})
+            return jsonify(error="nouser"), 404
+        now = now_ms(); r = RESETS.get(p["id"], {})
         wait = 60000 - (now - r.get("sent", 0))
         if wait > 0:
             return jsonify(error="wait", wait=math.ceil(wait / 1000), email=mask(p["email"])), 429
         code = f"{secrets.randbelow(10 ** 6):06d}"
-        d["resets"][p["id"]] = {"h": generate_password_hash(code), "exp": now + 600000, "sent": now, "tries": 0}
-        save(d); to, pid = p["email"], p["id"]
+        RESETS[p["id"]] = {"h": generate_password_hash(code), "exp": now + 600000, "sent": now, "tries": 0}
+        to, pid = p["email"], p["id"]
     try:
         send_mail(to, "PharmaLink - كود التأكيد / Code de vérification",
                   f"كود التأكيد تاعك: {code}\nصالح لمدة 10 دقائق.\n\nVotre code : {code} (valable 10 minutes).")
     except Exception as e:
         print("mail error:", e)
         with lock:
-            d = load(); d["resets"].pop(pid, None); save(d)
+            RESETS.pop(pid, None)
         return jsonify(error="mail"), 502
     return jsonify(ok=True, email=mask(to))
 
@@ -249,17 +265,16 @@ def forgot():
 def forgot_verify():
     b = body(); code = str(b.get("code", "")).strip()
     with lock:
-        d = load(); p = find_ph(d, str(b.get("name", ""))); r = d["resets"].get(p["id"]) if p else None
+        pharmacies = get_pharmacies(); p = find_ph(pharmacies, str(b.get("name", ""))); r = RESETS.get(p["id"]) if p else None
         if not r or r["exp"] < now_ms():
             return jsonify(error="expired"), 400
         if r["tries"] >= 5:
-            d["resets"].pop(p["id"], None); save(d)
+            RESETS.pop(p["id"], None)
             return jsonify(error="locked"), 429
         if not re.fullmatch(r"\d{6}", code) or not check_password_hash(r["h"], code):
-            r["tries"] += 1; save(d)
+            r["tries"] += 1
             return jsonify(error="code"), 400
         r["tok"], r["exp"] = secrets.token_hex(24), now_ms() + 600000
-        save(d)
     return jsonify(reset=r["tok"])
 
 @app.post("/api/forgot/reset")
@@ -268,19 +283,20 @@ def forgot_reset():
     if len(pw) < 6:
         return jsonify(error="short"), 400
     with lock:
-        d = load(); p = find_ph(d, str(b.get("name", ""))); r = d["resets"].get(p["id"]) if p else None
+        pharmacies = get_pharmacies(); p = find_ph(pharmacies, str(b.get("name", ""))); r = RESETS.get(p["id"]) if p else None
         if not r or r["exp"] < now_ms() or not r.get("tok") or not secrets.compare_digest(r["tok"], str(b.get("reset", ""))):
             return jsonify(error="expired"), 400
-        p["pw"] = generate_password_hash(pw)
-        d["resets"].pop(p["id"], None)
-        d["tokens"] = {k: v for k, v in d["tokens"].items() if not (v.get("id") == p["id"] and not v.get("emp"))}
-        save(d)
+        new_pw = generate_password_hash(pw)
+        supabase.table("pharmacies").update({"pw": new_pw}).eq("id", p["id"]).execute()
+        RESETS.pop(p["id"], None)
+        global TOKENS
+        TOKENS = {k: v for k, v in TOKENS.items() if not (v.get("id") == p["id"] and not v.get("emp"))}
     return jsonify(ok=True)
 
 # ---------- حساب الصيدلية والعاملين ----------
 @app.get("/api/me")
 def get_me():
-    d = load(); s = sess(d, "ph"); p = me(d, s); emp = s.get("emp")
+    s = sess("ph"); p = me(s); emp = s.get("emp")
     who = next((x for x in staff_of(p) if x["id"] == (emp or p["id"])), None) or abort(401)
     return jsonify(name=p["name"], photo=p.get("photo", ""), manager=p["manager"], address=p["address"],
                    wilaya=p.get("wilaya"), email="" if emp else p.get("email", ""), ord=p.get("ord", ""),
@@ -293,14 +309,14 @@ def set_photo():
         return jsonify(error="bad"), 400
     if len(ph) > 300000:
         return jsonify(error="big"), 413
-    with lock:
-        d = load(); s = sess(d, "ph"); main_only(s); p = me(d, s); p["photo"] = ph; save(d)
+    s = sess("ph"); main_only(s); p = me(s)
+    supabase.table("pharmacies").update({"photo": ph}).eq("id", p["id"]).execute()
     return jsonify(ok=True)
 
 @app.get("/api/staff")
 def staff_list():
-    d = load(); s = sess(d, "ph"); main_only(s); p = me(d, s)
-    return jsonify([{"id": e["id"], "name": e["name"]} for e in p.get("staff", [])])
+    s = sess("ph"); main_only(s); p = me(s)
+    return jsonify([{"id": e["id"], "name": e["name"]} for e in (p.get("staff") or [])])
 
 @app.post("/api/staff")
 def staff_add():
@@ -310,41 +326,47 @@ def staff_add():
     if len(pw) < 6:
         return jsonify(error="short"), 400
     with lock:
-        d = load(); s = sess(d, "ph"); main_only(s); p = me(d, s)
-        nm = name.lower()   # اسم العامل هو اسم الدخول: لازم يكون فريد
-        if nm == ADMIN_KEY.lower() or taken(d, name) or any(
-                nm in (q["manager"].strip().lower(), *[e["name"].strip().lower() for e in q.get("staff", [])])
-                for q in d["pharmacies"]):
+        pharmacies = get_pharmacies(); s = sess("ph"); main_only(s); p = me(s)
+        nm = name.lower()
+        if nm == ADMIN_KEY.lower() or taken(pharmacies, name) or any(
+                nm in (q["manager"].strip().lower(), *[e["name"].strip().lower() for e in (q.get("staff") or [])])
+                for q in pharmacies):
             return jsonify(error="namex"), 409
-        p.setdefault("staff", []).append({"id": secrets.token_hex(4), "name": name, "pw": generate_password_hash(pw)})
-        save(d)
+        staff_list_val = p.get("staff") or []
+        staff_list_val.append({"id": secrets.token_hex(4), "name": name, "pw": generate_password_hash(pw)})
+        supabase.table("pharmacies").update({"staff": staff_list_val}).eq("id", p["id"]).execute()
     return jsonify(ok=True)
 
 @app.post("/api/staff/delete")
 def staff_del():
     eid = body().get("id")
     with lock:
-        d = load(); s = sess(d, "ph"); main_only(s); p = me(d, s)
-        n = len(p.get("staff", []))
-        p["staff"] = [e for e in p.get("staff", []) if e["id"] != eid]
-        if len(p["staff"]) == n:
+        s = sess("ph"); main_only(s); p = me(s)
+        staff_list_val = p.get("staff") or []
+        n = len(staff_list_val)
+        new_staff = [e for e in staff_list_val if e["id"] != eid]
+        if len(new_staff) == n:
             abort(404)
-        d["tokens"] = {k: v for k, v in d["tokens"].items() if v.get("emp") != eid}
-        save(d)
+        supabase.table("pharmacies").update({"staff": new_staff}).eq("id", p["id"]).execute()
+        global TOKENS
+        TOKENS = {k: v for k, v in TOKENS.items() if v.get("emp") != eid}
     return jsonify(ok=True)
 
 # ---------- المرضى ----------
 @app.get("/api/patients")
 def patients():
-    d = load(); me(d, sess(d, "ph"))
-    info = {p["name"]: p for p in d["pharmacies"]}
+    me(sess("ph"))
+    pharmacies = get_pharmacies()
+    patients_data = get_patients()
+    info = {p["name"]: p for p in pharmacies}
     return jsonify([{**x, "addr": info.get(x["ph"], {}).get("address", ""),
-                     "wil": x.get("wil") or info.get(x["ph"], {}).get("wilaya")} for x in d["patients"]])
+                     "wil": x.get("wil") or info.get(x["ph"], {}).get("wilaya")} for x in patients_data])
 
 @app.get("/api/history")
 def history():
-    d = load(); p = me(d, sess(d, "ph"))
-    return jsonify([h for h in d["history"] if h["ph"] == p["name"]][-5000:])
+    p = me(sess("ph"))
+    hist = get_history()
+    return jsonify([h for h in hist if h["ph"] == p["name"]][-5000:])
 
 @app.post("/api/patients")
 def save_patient():
@@ -372,19 +394,20 @@ def save_patient():
     if not (fn and ln and dob and drug and ordn and 0 < dur and isinstance(pid, int) and re.fullmatch(r"\d{18}", nin) and re.fullmatch(ORD_RE, doc)):
         return jsonify(error="fill"), 400
     with lock:
-        d = load(); p = me(d, sess(d, "ph"))
-        who = confirm(p, b)          # تأكيد الصيدلاني: رقم الأوردر + كلمة السر
+        pharmacies = get_pharmacies(); p = me(sess("ph"))
+        who = confirm(p, b)
         if not who:
             return jsonify(error="conf"), 403
-        now = int(time.time() * 1000)
+        now = now_ms()
         active = lambda x: x["start"] + x["dur"] * DAY > now
-        old = next((x for x in d["patients"] if x["id"] == pid), None)
-        if any(x["ord"].lower() == ordn.lower() for x in d["patients"] if x is not old):
+        patients_data = get_patients()
+        old = next((x for x in patients_data if x["id"] == pid), None)
+        if any(x["ord"].lower() == ordn.lower() for x in patients_data if x is not old):
             return jsonify(error="ord"), 409
         newkeys = keys_of({"drugs": drugs} if drugs else {"drug": drug})
 
-        def clash(pn, pdob, skip):   # نفس الـ DCI نشط عند نفس المريض؟
-            for x in d["patients"]:
+        def clash(pn, pdob, skip):
+            for x in patients_data:
                 if x is skip or x["nin"] != pn or x["dob"] != pdob or not active(x):
                     continue
                 hit = newkeys & keys_of(x)
@@ -398,26 +421,34 @@ def save_patient():
             hit = clash(old["nin"], old["dob"], old)
             if hit is not None:
                 return jsonify(error="dci", drug=hit), 409
-            old.update(drug=drug, ord=ordn, dur=dur, start=now, ph=p["name"], doc=doc, by=who["name"], wil=p.get("wilaya"), pord=p.get("ord", ""))
-            if drugs:
-                old["drugs"] = drugs
-            else:
-                old.pop("drugs", None)
+            
+            up_data = {
+                "drug": drug, "ord": ordn, "dur": dur, "start": now, 
+                "ph": p["name"], "doc": doc, "by": who["name"], 
+                "wil": p.get("wilaya"), "pord": p.get("ord", ""),
+                "drugs": drugs if drugs else None
+            }
+            supabase.table("patients").update(up_data).eq("id", pid).execute()
             k, n = "logRenew", old["fn"] + " " + old["ln"]
         else:
-            same = [x for x in d["patients"] if x["nin"] == nin]
+            same = [x for x in patients_data if x["nin"] == nin]
             child = age(dob) < 7 and any(age(x["dob"]) >= 18 and active(x) for x in same)
             if same and not (child or any(x["dob"] == dob for x in same)):
                 return jsonify(error="nin"), 409
             hit = clash(nin, dob, None)
             if hit is not None:
                 return jsonify(error="dci", drug=hit), 409
-            d["patients"].append({"id": pid, "fn": fn, "ln": ln, "nin": nin, "dob": dob, "drug": drug,
-                                  "ord": ordn, "dur": dur, "start": now, "ph": p["name"], "doc": doc, "by": who["name"],
-                                  "wil": p.get("wilaya"), "pord": p.get("ord", ""), **({"drugs": drugs} if drugs else {})})
+            
+            new_patient = {
+                "id": pid, "fn": fn, "ln": ln, "nin": nin, "dob": dob, "drug": drug,
+                "ord": ordn, "dur": dur, "start": now, "ph": p["name"], "doc": doc, "by": who["name"],
+                "wil": p.get("wilaya"), "pord": p.get("ord", ""), **({"drugs": drugs} if drugs else {})
+            }
+            supabase.table("patients").insert(new_patient).execute()
             k, n = "logNew", fn + " " + ln
-        d["history"].append({"id": secrets.token_hex(4), "t": now, "k": k, "n": n, "ph": p["name"], "by": who["name"]})
-        save(d)
+            
+        new_history = {"id": secrets.token_hex(4), "t": now, "k": k, "n": n, "ph": p["name"], "by": who["name"]}
+        supabase.table("history").insert(new_history).execute()
     return jsonify(ok=True)
 
 @app.post("/api/patients/complete")
@@ -430,12 +461,13 @@ def complete_patient():
     if not isinstance(pid, int) or any(a < 0 for a in adds) or not any(adds):
         return jsonify(error="fill"), 400
     with lock:
-        d = load(); p = me(d, sess(d, "ph"))
+        p = me(sess("ph"))
         who = confirm(p, b)
         if not who:
             return jsonify(error="conf"), 403
-        now = int(time.time() * 1000)
-        x = next((x for x in d["patients"] if x["id"] == pid), None)
+        now = now_ms()
+        patients_data = get_patients()
+        x = next((x for x in patients_data if x["id"] == pid), None)
         if not x or not x.get("drugs") or len(adds) != len(x["drugs"]):
             abort(404)
         if x["start"] + x["dur"] * DAY <= now:
@@ -446,27 +478,32 @@ def complete_patient():
             return jsonify(error="over"), 400
         for a, dr in zip(adds, x["drugs"]):
             dr["q"] += a
-        x["drug"] = drug_str(x["drugs"])
-        d["history"].append({"id": secrets.token_hex(4), "t": now, "k": "logDone", "n": x["fn"] + " " + x["ln"],
-                             "ph": p["name"], "by": who["name"]})
-        save(d)
+        new_drug_str = drug_str(x["drugs"])
+        
+        supabase.table("patients").update({"drugs": x["drugs"], "drug": new_drug_str}).eq("id", pid).execute()
+        new_history = {"id": secrets.token_hex(4), "t": now, "k": "logDone", "n": x["fn"] + " " + x["ln"],
+                       "ph": p["name"], "by": who["name"]}
+        supabase.table("history").insert(new_history).execute()
     return jsonify(ok=True)
 
 # ---------- الأدمن ----------
 @app.get("/api/admin/overview")
 def overview():
-    d = load(); sess(d, "admin"); now = int(time.time() * 1000)
+    sess("admin"); now = now_ms()
+    pharmacies = get_pharmacies()
+    patients_data = get_patients()
+    history_data = get_history()
     out = []
-    for p in d["pharmacies"]:
+    for p in pharmacies:
         row = {k: p.get(k) for k in ("id", "name", "manager", "address", "lat", "lng", "status", "created", "photo", "wilaya", "email", "ord", "expires")}
-        row["patients"] = sum(1 for x in d["patients"] if x["ph"] == p["name"])
-        row["ops"] = sum(1 for h in d["history"] if h["ph"] == p["name"])
+        row["patients"] = sum(1 for x in patients_data if x["ph"] == p["name"])
+        row["ops"] = sum(1 for h in history_data if h["ph"] == p["name"])
         out.append(row)
-    return jsonify(pharmacies=out, patients=len(d["patients"]),
-                   today=sum(1 for h in d["history"] if now - h["t"] < DAY))
+    return jsonify(pharmacies=out, patients=len(patients_data),
+                   today=sum(1 for h in history_data if now - h["t"] < DAY))
 
-def find(d, b):
-    return next((x for x in d["pharmacies"] if x["id"] == b.get("id")), None) or abort(404)
+def find(pharmacies, b):
+    return next((x for x in pharmacies if x["id"] == b.get("id")), None) or abort(404)
 
 @app.post("/api/admin/status")
 def set_status():
@@ -475,16 +512,16 @@ def set_status():
         abort(400)
     m = months(b)
     if b["status"] == "approved" and not m:
-        abort(400)                       # القبول لازم يكون معاه عدد الأشهر
+        abort(400)
     with lock:
-        d = load(); sess(d, "admin"); p = find(d, b)
+        pharmacies = get_pharmacies(); sess("admin"); p = find(pharmacies, b)
         if b["status"] == "approved":
             grant(p, m)
+            supabase.table("pharmacies").update({"status": "approved", "expires": p["expires"]}).eq("id", p["id"]).execute()
         else:
-            p["status"] = "rejected"
-        if b["status"] == "rejected":
-            d["tokens"] = {k: v for k, v in d["tokens"].items() if v.get("id") != p["id"]}
-        save(d)
+            supabase.table("pharmacies").update({"status": "rejected"}).eq("id", p["id"]).execute()
+            global TOKENS
+            TOKENS = {k: v for k, v in TOKENS.items() if v.get("id") != p["id"]}
     return jsonify(ok=True)
 
 @app.post("/api/admin/renew")
@@ -493,10 +530,11 @@ def renew():
     if not m:
         abort(400)
     with lock:
-        d = load(); sess(d, "admin"); p = find(d, b)
+        pharmacies = get_pharmacies(); sess("admin"); p = find(pharmacies, b)
         if p["status"] != "approved":
             abort(400)
-        grant(p, m); save(d)
+        grant(p, m)
+        supabase.table("pharmacies").update({"expires": p["expires"]}).eq("id", p["id"]).execute()
     return jsonify(ok=True, expires=p["expires"])
 
 @app.post("/api/admin/email")
@@ -505,10 +543,10 @@ def admin_email():
     if not re.fullmatch(EMAIL_RE, em):
         abort(400)
     with lock:
-        d = load(); sess(d, "admin"); p = find(d, b)
-        if any(x.get("email") == em and x["id"] != p["id"] for x in d["pharmacies"]):
+        pharmacies = get_pharmacies(); sess("admin"); p = find(pharmacies, b)
+        if any(x.get("email") == em and x["id"] != p["id"] for x in pharmacies):
             return jsonify(error="emailx"), 409
-        p["email"] = em; save(d)
+        supabase.table("pharmacies").update({"email": em}).eq("id", p["id"]).execute()
     return jsonify(ok=True)
 
 @app.post("/api/admin/rename")
@@ -517,21 +555,29 @@ def rename():
     if not new:
         abort(400)
     with lock:
-        d = load(); sess(d, "admin"); p = find(d, b)
-        if new.lower() == ADMIN_KEY.lower() or taken(d, new, p["id"]):
+        pharmacies = get_pharmacies(); sess("admin"); p = find(pharmacies, b)
+        if new.lower() == ADMIN_KEY.lower() or taken(pharmacies, new, p["id"]):
             return jsonify(error="exists"), 409
-        old, p["name"] = p["name"], new
-        for x in d["patients"] + d["history"]:
+        old, name_val = p["name"], new
+        supabase.table("pharmacies").update({"name": name_val}).eq("id", p["id"]).execute()
+        
+        patients_data = get_patients()
+        for x in patients_data:
             if x["ph"] == old:
-                x["ph"] = new
-        save(d)
+                supabase.table("patients").update({"ph": name_val}).eq("id", x["id"]).execute()
+        history_data = get_history()
+        for h in history_data:
+            if h["ph"] == old:
+                supabase.table("history").update({"ph": name_val}).eq("id", h["id"]).execute()
     return jsonify(ok=True)
 
 @app.get("/api/admin/patients")
 def admin_patients():
-    d = load(); sess(d, "admin")
-    wm = {p["name"]: p.get("wilaya") for p in d["pharmacies"]}
-    return jsonify([{**x, "wil": x.get("wil") or wm.get(x["ph"])} for x in d["patients"]])
+    sess("admin")
+    pharmacies = get_pharmacies()
+    patients_data = get_patients()
+    wm = {p["name"]: p.get("wilaya") for p in pharmacies}
+    return jsonify([{**x, "wil": x.get("wil") or wm.get(x["ph"])} for x in patients_data])
 
 @app.post("/api/admin/patient/update")
 def admin_patient_update():
@@ -545,39 +591,41 @@ def admin_patient_update():
     if not (fn and ln and dob and drug and ordn and ph and 0 < dur <= 3650 and start > 0 and re.fullmatch(r"\d{18}", nin)):
         return jsonify(error="fill"), 400
     with lock:
-        d = load(); sess(d, "admin")
-        x = next((x for x in d["patients"] if x["id"] == b.get("id")), None) or abort(404)
-        if not any(p["name"] == ph for p in d["pharmacies"]):
+        pharmacies = get_pharmacies(); sess("admin")
+        patients_data = get_patients()
+        x = next((x for x in patients_data if x["id"] == b.get("id")), None) or abort(404)
+        if not any(p["name"] == ph for p in pharmacies):
             return jsonify(error="fill"), 400
-        if any(y["ord"].lower() == ordn.lower() for y in d["patients"] if y is not x):
+        if any(y["ord"].lower() == ordn.lower() for y in patients_data if y is not x):
             return jsonify(error="ord"), 409
+        
+        up_data = {
+            "fn": fn, "ln": ln, "nin": nin, "dob": dob, 
+            "drug": drug, "ord": ordn, "dur": dur, "start": start, "ph": ph
+        }
         if drug != x.get("drug"):
-            x.pop("drugs", None)
-        x.update(fn=fn, ln=ln, nin=nin, dob=dob, drug=drug, ord=ordn, dur=dur, start=start, ph=ph)
-        save(d)
+            up_data["drugs"] = None
+        supabase.table("patients").update(up_data).eq("id", x["id"]).execute()
     return jsonify(ok=True)
 
 @app.post("/api/admin/patient/delete")
 def admin_patient_delete():
     b = body()
     with lock:
-        d = load(); sess(d, "admin")
-        n = len(d["patients"])
-        d["patients"] = [x for x in d["patients"] if x["id"] != b.get("id")]
-        if len(d["patients"]) == n:
-            abort(404)
-        save(d)
+        sess("admin")
+        supabase.table("patients").delete().eq("id", b.get("id")).execute()
     return jsonify(ok=True)
 
 @app.get("/api/admin/history")
 def a_history():
-    with lock:
-        d = load(); sess(d, "admin")
-        if any("id" not in h for h in d["history"]):
-            for h in d["history"]:
-                h.setdefault("id", secrets.token_hex(4))
-            save(d)
-    return jsonify(d["history"])
+    sess("admin")
+    history_data = get_history()
+    for h in history_data:
+        if "id" not in h or not h["id"]:
+            new_id = secrets.token_hex(4)
+            supabase.table("history").update({"id": new_id}).eq("t", h["t"]).execute()
+            h["id"] = new_id
+    return jsonify(history_data)
 
 @app.post("/api/admin/history/update")
 def a_history_update():
@@ -590,20 +638,20 @@ def a_history_update():
     if not (tm > 0 and n and b.get("k") in ("logNew", "logRenew")):
         return jsonify(error="fill"), 400
     with lock:
-        d = load(); sess(d, "admin")
-        h = next((x for x in d["history"] if x.get("id") == b.get("id")), None) or abort(404)
-        if not any(p["name"] == b.get("ph") for p in d["pharmacies"]):
+        pharmacies = get_pharmacies(); sess("admin")
+        history_data = get_history()
+        h = next((x for x in history_data if x.get("id") == b.get("id")), None) or abort(404)
+        if not any(p["name"] == b.get("ph") for p in pharmacies):
             return jsonify(error="fill"), 400
-        h.update(t=tm, k=b["k"], n=n, ph=b["ph"]); save(d)
+        supabase.table("history").update({"t": tm, "k": b["k"], "n": n, "ph": b["ph"]}).eq("id", h["id"]).execute()
     return jsonify(ok=True)
 
 @app.post("/api/admin/history/delete")
 def a_history_delete():
     b = body()
     with lock:
-        d = load(); sess(d, "admin")
-        h = next((x for x in d["history"] if x.get("id") == b.get("id")), None) or abort(404)
-        d["history"].remove(h); save(d)
+        sess("admin")
+        supabase.table("history").delete().eq("id", b.get("id")).execute()
     return jsonify(ok=True)
 
 if __name__ == "__main__":

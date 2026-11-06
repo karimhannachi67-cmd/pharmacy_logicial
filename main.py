@@ -48,7 +48,7 @@ def send_brevo_mail(to_email, subject, html_content):
         "content-type": "application/json"
     }
     payload = {
-        "sender": {"name": "PharmaLink", "email": "no-reply@pharmalink.com"},
+        "sender": {"name": "PharmaLink", "email": "pharmalink132@gmail.com.com"},
         "to": [{"email": to_email}],
         "subject": subject,
         "htmlContent": html_content

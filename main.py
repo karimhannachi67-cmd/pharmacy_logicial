@@ -24,7 +24,7 @@ supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 # إعدادات Brevo API
 BREVO_API_KEY = os.environ.get("BREVO_KEY", "")
 
-ADMIN_KEY = os.environ.get("ADMIN_KEY", "adminadmin08")
+ADMIN_KEY = os.environ.get("ADMIN_KEY", "")
 DAY = 86400000
 lock = threading.Lock()
 
